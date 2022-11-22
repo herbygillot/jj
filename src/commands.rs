@@ -24,7 +24,7 @@ use std::time::Instant;
 use std::{fs, io};
 
 use chrono::{FixedOffset, LocalResult, TimeZone, Utc};
-use clap::{ArgGroup, ArgMatches, CommandFactory, FromArgMatches, Subcommand};
+use clap::{ArgAction, ArgGroup, ArgMatches, CommandFactory, FromArgMatches, Subcommand};
 use itertools::Itertools;
 use jujutsu_lib::backend::{BackendError, CommitId, Timestamp, TreeValue};
 use jujutsu_lib::commit::Commit;
@@ -676,9 +676,13 @@ enum BranchSubcommand {
     /// recreated on future pulls if it still exists in the remote.
     #[command(visible_alias("f"))]
     Forget {
-        /// The branches to delete.
-        #[arg(required = true)]
+        /// The branches to forget.
+        #[arg(required_unless_present_any(&["glob"]))]
         names: Vec<String>,
+
+        /// A glob pattern indicating a branch to forget.
+        #[arg(action(ArgAction::Append), long = "glob")]
+        glob: Vec<String>,
     },
 
     /// List branches and their targets
@@ -3232,6 +3236,21 @@ fn cmd_branch(
         Ok(())
     }
 
+    fn find_globs(view: &View, globs: &[String]) -> Result<Vec<String>, CommandError> {
+        let globs: Vec<glob::Pattern> = globs
+            .iter()
+            .map(|glob| glob::Pattern::new(glob))
+            .try_collect()?;
+        let matching_branches = view
+            .branches()
+            .iter()
+            .map(|(branch_name, _branch_target)| branch_name)
+            .filter(|branch_name| globs.iter().any(|glob| glob.matches(branch_name)))
+            .cloned()
+            .collect();
+        Ok(matching_branches)
+    }
+
     fn make_branch_term(branch_names: &[impl AsRef<str>]) -> String {
         match branch_names {
             [branch_name] => format!("branch {}", branch_name.as_ref()),
@@ -3332,12 +3351,20 @@ fn cmd_branch(
             workspace_command.finish_transaction(ui, tx)?;
         }
 
-        BranchSubcommand::Forget { names } => {
+        BranchSubcommand::Forget { names, glob } => {
             validate_branch_names_exist(view, names)?;
-            let mut tx =
-                workspace_command.start_transaction(&format!("forget {}", make_branch_term(names)));
+            let globbed_names = find_globs(view, glob)?;
+            let names = names
+                .iter()
+                .cloned()
+                .chain(globbed_names)
+                .sorted()
+                .unique()
+                .collect_vec();
+            let branch_term = make_branch_term(&names);
+            let mut tx = workspace_command.start_transaction(&format!("forget {}", branch_term));
             for branch_name in names {
-                tx.mut_repo().remove_branch(branch_name);
+                tx.mut_repo().remove_branch(&branch_name);
             }
             workspace_command.finish_transaction(ui, tx)?;
         }
